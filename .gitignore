@@ -1,0 +1,28 @@
+# Binaries
+proxy
+proxy-*
+*.exe
+
+# TLS certificates (may contain private keys)
+*.pem
+*.key
+*.p12
+*.pfx
+cert.pem
+key.pem
+
+# User config (contains secrets / personal URLs)
+config.yaml
+config.local.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.claude/
+.smbdelete*
