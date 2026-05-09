@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -15,8 +14,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
-
-const basePath = "/apps/anthropic"
 
 var httpClient = newHTTPClient()
 var cfg Config
@@ -153,28 +150,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions":
-		// Standard paths: append directly to provider base_url
 		upstreamURL = p.BaseURL + r.URL.Path
-		if r.URL.RawQuery != "" {
-			upstreamURL += "?" + r.URL.RawQuery
-		}
-
-	case strings.HasPrefix(r.URL.Path, basePath+"/v1/models") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-		handleModelsRequest(w, r)
-		return
-
-	case strings.HasPrefix(r.URL.Path, basePath):
-		// Cowork path: strip basePath, then append to provider base_url
-		remainder := strings.TrimPrefix(r.URL.Path, basePath)
-		if remainder == "" {
-			remainder = "/"
-		}
-		var err error
-		upstreamURL, err = url.JoinPath(p.BaseURL, remainder)
-		if err != nil {
-			jsonResponse(w, 500, "Invalid upstream URL", "api_error")
-			return
-		}
 		if r.URL.RawQuery != "" {
 			upstreamURL += "?" + r.URL.RawQuery
 		}
@@ -388,8 +364,7 @@ func main() {
 	log.Printf("cowork-rename-proxy listening on %s", addr)
 	log.Printf("  current provider: %s", cfg.CurrentProvider)
 	log.Printf("  providers: %d configured", len(cfg.Providers))
-	log.Printf("  endpoints: %s://%s/v1/messages  (Claude Code, standard)", scheme, addr)
-	log.Printf("             %s://%s%s/v1/messages (Cowork, prefixed)", scheme, addr, basePath)
+	log.Printf("  endpoints: %s://%s/v1/messages, /v1/chat/completions, /v1/models", scheme, addr)
 
 	if cfg.TLS {
 		certFile := cfg.TLSCert
