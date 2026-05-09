@@ -59,34 +59,41 @@ func watchConfig(path string) {
 	}
 }
 
-func rewriteModelOut(model string) string {
+func resolveProvider() (*Provider, error) {
 	cfgMu.RLock()
-	prefix := cfg.ModelPrefix
-	target := cfg.TargetModel
-	mode := cfg.Mode
+	name := cfg.CurrentProvider
+	providers := cfg.Providers
 	cfgMu.RUnlock()
-	switch mode {
+
+	if name == "" {
+		return nil, fmt.Errorf("current_provider not configured")
+	}
+	for i := range providers {
+		if providers[i].Name == name {
+			return &providers[i], nil
+		}
+	}
+	return nil, fmt.Errorf("provider %q not found", name)
+}
+
+func resolveModelOut(model string, p *Provider) string {
+	switch p.Mode {
 	case "force":
-		return target
+		return p.TargetModel
 	case "prefix":
-		return strings.TrimPrefix(model, prefix)
+		return strings.TrimPrefix(model, p.ModelPrefix)
 	default:
 		return model
 	}
 }
 
-func rewriteModelIn(model string) string {
-	cfgMu.RLock()
-	prefix := cfg.ModelPrefix
-	target := cfg.TargetModel
-	mode := cfg.Mode
-	cfgMu.RUnlock()
-	switch mode {
+func resolveModelIn(model string, p *Provider) string {
+	switch p.Mode {
 	case "force":
-		return target
+		return p.TargetModel
 	case "prefix":
-		if !strings.HasPrefix(model, prefix) {
-			return prefix + model
+		if !strings.HasPrefix(model, p.ModelPrefix) {
+			return p.ModelPrefix + model
 		}
 		return model
 	default:
@@ -102,48 +109,26 @@ func jsonResponse(w http.ResponseWriter, status int, msg, errType string) {
 	})
 }
 
-// handleModelsRequest forwards /v1/models to upstream, appends mock_models, and returns.
-func handleModelsRequest(w http.ResponseWriter, r *http.Request, mockModels []string) {
-	if cfg.UpstreamBaseURL == "" {
-		// No upstream configured, return mock models only
-		returnMockModels(w, mockModels)
-		return
-	}
+// handleModelsRequest aggregates models from all providers + mock_models
+func handleModelsRequest(w http.ResponseWriter, r *http.Request) {
+	cfgMu.RLock()
+	providers := cfg.Providers
+	mockModels := cfg.MockModels
+	cfgMu.RUnlock()
 
-	upstreamModelsURL := cfg.UpstreamBaseURL + "/v1/models"
-	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamModelsURL, nil)
-	if err != nil {
-		returnMockModels(w, mockModels)
-		return
-	}
-	upstreamResp, err := httpClient.Do(upReq)
-	if err != nil {
-		returnMockModels(w, mockModels)
-		return
-	}
-	defer upstreamResp.Body.Close()
-
-	if upstreamResp.StatusCode == http.StatusOK {
-		var body map[string]any
-		if json.NewDecoder(upstreamResp.Body).Decode(&body) == nil {
-			if data, ok := body["data"].([]any); ok && len(mockModels) > 0 {
-				for _, name := range mockModels {
-					data = append(data, map[string]any{
-						"id": name, "object": "model", "name": name,
-					})
-				}
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(body)
-			return
+	// Collect unique model names from all providers
+	modelSet := make(map[string]bool)
+	for _, p := range providers {
+		for _, m := range p.Models {
+			modelSet[m] = true
 		}
 	}
-	returnMockModels(w, mockModels)
-}
+	for _, m := range mockModels {
+		modelSet[m] = true
+	}
 
-func returnMockModels(w http.ResponseWriter, names []string) {
 	models := []map[string]any{}
-	for _, name := range names {
+	for name := range modelSet {
 		models = append(models, map[string]any{
 			"id": name, "object": "model", "name": name,
 		})
@@ -153,69 +138,51 @@ func returnMockModels(w http.ResponseWriter, names []string) {
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, basePath) {
+	p, err := resolveProvider()
+	if err != nil {
+		jsonResponse(w, 500, err.Error(), "configuration_error")
+		return
+	}
+
+	// Determine upstream URL and path
+	var upstreamURL string
+
+	switch {
+	case r.URL.Path == "/v1/models" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		handleModelsRequest(w, r)
+		return
+
+	case r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions":
+		// Standard paths: append directly to provider base_url
+		upstreamURL = p.BaseURL + r.URL.Path
+		if r.URL.RawQuery != "" {
+			upstreamURL += "?" + r.URL.RawQuery
+		}
+
+	case strings.HasPrefix(r.URL.Path, basePath+"/v1/models") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		handleModelsRequest(w, r)
+		return
+
+	case strings.HasPrefix(r.URL.Path, basePath):
+		// Cowork path: strip basePath, then append to provider base_url
+		remainder := strings.TrimPrefix(r.URL.Path, basePath)
+		if remainder == "" {
+			remainder = "/"
+		}
+		var err error
+		upstreamURL, err = url.JoinPath(p.BaseURL, remainder)
+		if err != nil {
+			jsonResponse(w, 500, "Invalid upstream URL", "api_error")
+			return
+		}
+		if r.URL.RawQuery != "" {
+			upstreamURL += "?" + r.URL.RawQuery
+		}
+
+	default:
 		jsonResponse(w, 404, fmt.Sprintf("Route not found: %s", r.URL.Path), "not_found_error")
 		return
 	}
-
-	// Intercept /v1/models: forward to upstream and append mock_models
-	modelsPath := basePath + "/v1/models"
-	if r.URL.Path == modelsPath && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		cfgMu.RLock()
-		mockModels := cfg.MockModels
-		mode := cfg.Mode
-		cfgMu.RUnlock()
-
-		// transparent mode: pass through to upstream without interception
-		if mode == "" {
-			goto forwardToUpstream
-		}
-
-		handleModelsRequest(w, r, mockModels)
-		return
-	}
-forwardToUpstream:
-
-	// Build upstream URL: use upstream's own path as the base, not basePath.
-	// This avoids double-prefix when cowork base URL includes /v1/messages.
-	if cfg.UpstreamBaseURL == "" {
-		jsonResponse(w, 500, "upstream_base_url not configured", "configuration_error")
-		return
-	}
-	upstreamParsed, err := url.Parse(cfg.UpstreamBaseURL)
-	if err != nil {
-		jsonResponse(w, 500, "Invalid upstream URL", "api_error")
-		return
-	}
-
-	// Determine what prefix to strip from the incoming request path.
-	// We look for the upstream path in the request to avoid double-prefixing.
-	upstreamPath := upstreamParsed.Path
-	remainder := strings.TrimPrefix(r.URL.Path, basePath)
-
-	// If remainder starts with the upstream path, strip it to avoid duplication
-	if strings.HasPrefix(remainder, upstreamPath) {
-		remainder = strings.TrimPrefix(remainder, upstreamPath)
-	}
-	if remainder == "" {
-		remainder = "/"
-	}
-
-	// Build path-only URL first, then attach query separately
-	upstreamURL, err := url.JoinPath(cfg.UpstreamBaseURL, remainder)
-	if err != nil {
-		jsonResponse(w, 500, "Invalid upstream URL", "api_error")
-		return
-	}
-	upstreamParsed, err = url.Parse(upstreamURL)
-	if err != nil {
-		jsonResponse(w, 500, "Invalid upstream URL", "api_error")
-		return
-	}
-	if r.URL.RawQuery != "" {
-		upstreamParsed.RawQuery = r.URL.RawQuery
-	}
-	upstreamURL = upstreamParsed.String()
 
 	var bodyBytes []byte
 	var reqModel any
@@ -231,15 +198,25 @@ forwardToUpstream:
 		var body map[string]any
 		if err := json.Unmarshal(bodyBytes, &body); err == nil {
 			if model, ok := body["model"].(string); ok {
-				// Force to target model if configured, otherwise strip prefix
-				if cfg.TargetModel != "" {
-					body["model"] = cfg.TargetModel
-				} else {
-					body["model"] = rewriteModelOut(model)
+				// Check model allowance
+				if len(p.Models) > 0 {
+					allowed := false
+					for _, m := range p.Models {
+						if m == model {
+							allowed = true
+							break
+						}
+					}
+					if !allowed {
+						jsonResponse(w, 400, fmt.Sprintf("model %q is not supported by provider %q", model, p.Name), "invalid_request_error")
+						return
+					}
 				}
+
+				body["model"] = resolveModelOut(model, p)
 				reqModel = body["model"]
+				bodyBytes, _ = json.Marshal(body)
 			}
-			bodyBytes, _ = json.Marshal(body)
 		}
 	}
 
@@ -252,14 +229,20 @@ forwardToUpstream:
 		return
 	}
 
-	// Forward all headers except hop-by-hop and content-length
-	skipHeaders := map[string]bool{
-		"host": true, "connection": true, "content-length": true,
-	}
-	for k, v := range r.Header {
-		if !skipHeaders[strings.ToLower(k)] {
-			for _, hv := range v {
-				upstreamReq.Header.Add(k, hv)
+	// Inject provider API key if configured
+	if p.APIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+p.APIKey)
+		upstreamReq.Header.Set("x-api-key", p.APIKey)
+	} else {
+		// Forward client headers
+		skipHeaders := map[string]bool{
+			"host": true, "connection": true, "content-length": true,
+		}
+		for k, v := range r.Header {
+			if !skipHeaders[strings.ToLower(k)] {
+				for _, hv := range v {
+					upstreamReq.Header.Add(k, hv)
+				}
 			}
 		}
 	}
@@ -309,11 +292,11 @@ forwardToUpstream:
 				var j map[string]any
 				if json.Unmarshal(jsonPart, &j) == nil {
 					if model, ok := j["model"].(string); ok {
-						j["model"] = rewriteModelIn(model)
+						j["model"] = resolveModelIn(model, p)
 					}
 					if msg, ok := j["message"].(map[string]any); ok {
 						if model, ok := msg["model"].(string); ok {
-							msg["model"] = rewriteModelIn(model)
+							msg["model"] = resolveModelIn(model, p)
 						}
 					}
 					out, _ := json.Marshal(j)
@@ -334,7 +317,7 @@ forwardToUpstream:
 		var j map[string]any
 		if json.Unmarshal(respBytes, &j) == nil {
 			if model, ok := j["model"].(string); ok {
-				j["model"] = rewriteModelIn(model)
+				j["model"] = resolveModelIn(model, p)
 				out, _ := json.Marshal(j)
 				w.Write(out)
 				return
@@ -383,6 +366,14 @@ func newHTTPClient() *http.Client {
 func main() {
 	cfg = loadConfig()
 
+	// Validate config
+	if len(cfg.Providers) == 0 {
+		log.Fatal("no providers configured")
+	}
+	if cfg.CurrentProvider == "" {
+		log.Fatal("current_provider not set")
+	}
+
 	// Start config file watcher for hot-reload
 	go watchConfig(cfgPath)
 
@@ -394,10 +385,11 @@ func main() {
 	if cfg.TLS {
 		scheme = "https"
 	}
-	log.Printf("anthropic-model-rewrite-proxy listening on %s", addr)
-	log.Printf("  upstream:    %s", cfg.UpstreamBaseURL)
-	log.Printf("  model strip: %q prefix", cfg.ModelPrefix)
-	log.Printf("  endpoint:    %s://%s%s/v1/messages", scheme, addr, basePath)
+	log.Printf("cowork-rename-proxy listening on %s", addr)
+	log.Printf("  current provider: %s", cfg.CurrentProvider)
+	log.Printf("  providers: %d configured", len(cfg.Providers))
+	log.Printf("  endpoints: %s://%s/v1/messages  (Claude Code, standard)", scheme, addr)
+	log.Printf("             %s://%s%s/v1/messages (Cowork, prefixed)", scheme, addr, basePath)
 
 	if cfg.TLS {
 		certFile := cfg.TLSCert

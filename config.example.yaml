@@ -8,29 +8,38 @@ port: 18080        # 监听端口
 # TLS
 # ========================================
 tls: true                        # 是否开启 HTTPS
-tls_cert: ""                     # 证书路径（留空则自动生成自签证书）
-tls_key:  ""                     # 私钥路径（留空则自动生成）
+tls_cert: ""                     # 证书路径（推荐 mkcert 生成）
+tls_key:  ""                     # 私钥路径（推荐 mkcert 生成）
 
 # ========================================
-# 代理目标
+# 当前激活的 Provider
 # ========================================
-upstream_base_url: ""  # 留空则转发失败，请填写实际上游地址
+current_provider: "dashscope"    # 从 providers 列表中选择一个
 
 # ========================================
-# 模型配置
+# Provider 列表
 # ========================================
-# mode 可选值：
-#   "force"  — 统一代理：所有请求都强制改写为 target_model
-#   "prefix" — 前缀模式：claude-X 改写为 X（去前缀转发，响应加前缀返回）
-#   ""       — 透明转发：不改写任何模型，直接代理到上游（不拦截 /v1/models）
-mode: "force"
+providers:
+  - name: "dashscope"
+    base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic"
+    api_key: ""                  # 留空则转发客户端的 key
+    mode: "force"                # force / prefix / ""(透明转发)
+    target_model: "glm-5.1"      # force 模式目标
+    model_prefix: "claude-"      # prefix 模式前缀
+    models:                      # 支持的模型列表，空=全部接受
+      - "glm-5.1"
+      - "claude-glm-5.1"
 
-target_model: "glm-5.1"  # force 模式下强制使用的模型
-model_prefix: "claude-"        # prefix 模式下添加/去除的前缀
+  - name: "openrouter"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: ""                  # 填入你的 API Key
+    models:
+      - "claude-sonnet-4-6"
+      - "claude-sonnet-4.6"
 
-# /v1/models 端点返回的伪造模型列表（cowork 依赖此接口）
+# ========================================
+# /v1/models 返回时追加的额外模型
+# ========================================
 mock_models:
-  - "claude-glm-5.1"
-  - "glm-5.1"
   - "claude-sonnet-4-6"
   - "claude-sonnet-4.6"

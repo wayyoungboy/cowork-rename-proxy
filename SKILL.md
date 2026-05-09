@@ -26,14 +26,13 @@ chmod +x proxy-*   # macOS / Linux
 GOOS=$(go env GOOS) GOARCH=$(go env GOARCH) go build -o proxy .
 ```
 
-### 2. 生成 TLS 证书（Cowork 要求 HTTPS）
+### 2. 生成 TLS 证书（客户端要求 HTTPS）
 
 检查是否已有证书文件。如果没有，使用 mkcert 生成：
 
 ```bash
-# 检测 mkcert
 which mkcert >/dev/null 2>&1 || {
-  echo "请先安装 mkcert: brew install mkcert (macOS) / scoop install mkcert (Windows) / 下载 https://github.com/FiloSottile/mkcert/releases"
+  echo "请先安装 mkcert: brew install mkcert (macOS) / scoop install mkcert (Windows)"
   exit 1
 }
 
@@ -47,11 +46,10 @@ mkcert localhost   # 生成 localhost.pem 和 localhost-key.pem
 
 | 字段 | 说明 |
 |------|------|
-| `upstream_base_url` | 上游 API 地址 |
-| `target_model` | force 模式的目标模型 |
-| `mode` | force / prefix / 留空(透明转发) |
-| `mock_models` | 要追加到 /v1/models 的模型列表 |
-| `tls_cert` / `tls_key` | 证书路径（mkcert 生成的路径） |
+| `providers` | 上游列表，每个包含 base_url、api_key（可选）、models 列表、mode |
+| `current_provider` | 当前激活的 provider name |
+| `mock_models` | 追加到 /v1/models 的模型列表 |
+| `tls_cert` / `tls_key` | 证书路径 |
 
 生成 `config.yaml`。
 
@@ -61,20 +59,22 @@ mkcert localhost   # 生成 localhost.pem 和 localhost-key.pem
 ./proxy -config config.yaml   # Windows: .\proxy.exe -config config.yaml
 ```
 
-服务监听在 `https://127.0.0.1:18080/apps/anthropic`
+服务监听在 `https://127.0.0.1:18080`
 
 ### 5. 验证
 
 ```bash
-curl -sk https://localhost:18080/apps/anthropic/v1/models
+curl -sk https://localhost:18080/v1/models
 ```
 
-应返回上游原始模型列表 + mock_models 追加的内容。
+应返回所有 provider 的 models + mock_models 的聚合列表。
 
-### 6. 告知用户 Cowork 配置
+### 6. 告知用户客户端配置
 
 ```
+# Claude Code / Cowork
+Base URL:  https://localhost:18080
+# Cowork 也用 /apps/anthropic 前缀：
 Base URL:  https://localhost:18080/apps/anthropic
-API Key:   用户的上游 API Key
-Model:     与 mock_models 中任一项匹配
+Model:     与 provider models 列表中任一项匹配
 ```
